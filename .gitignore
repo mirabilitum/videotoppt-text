@@ -1,0 +1,46 @@
+# Environment and secrets
+.env
+.env.*
+*.env
+
+# Generated data
+output/
+.codex_tmp/
+.claude/
+Agent.md
+PROJECT_STATUS.md
+link.txt
+
+# Local inputs and spreadsheets
+*.xlsx
+*.xls
+*.xlsm
+*.csv
+
+# Local runtime assets
+models/
+packages/
+bin/
+
+# Python cache and test artifacts
+__pycache__/
+*.py[cod]
+*.pyc.*
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS junk
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+

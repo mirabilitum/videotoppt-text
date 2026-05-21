@@ -1,0 +1,9 @@
+funasr
+modelscope
+openai
+requests
+opencv-python-headless
+imageio-ffmpeg
+python-dotenv
+openpyxl
+playwright
