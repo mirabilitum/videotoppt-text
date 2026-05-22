@@ -14,7 +14,7 @@ PYTHON = Path(os.environ.get("PYTHON_EXE", r"C:\Users\Administrator\AppData\Loca
 
 class SplitAudioTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.workdir = Path(r"D:\video\.codex_tmp\tests\split_audio")
+        self.workdir = ROOT / ".codex_tmp" / "tests" / "split_audio"
         self.workdir.mkdir(parents=True, exist_ok=True)
         self.ffmpeg = find_ffmpeg()
         self.env = os.environ.copy()

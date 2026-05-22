@@ -11,6 +11,13 @@ from pathlib import Path
 from openai import OpenAI
 
 from common import load_config, output_dir
+from text_filter import (
+    adjust_span_to_alias_boundary,
+    assert_no_alias_fragments,
+    decrypt_text,
+    encrypt_text,
+    load_sensitive_word_map,
+)
 
 
 DEFAULT_PROMPT_PATH = Path("D:/video/prompt/prompt.md")
@@ -213,6 +220,7 @@ def slice_chapter_transcripts(
 ) -> dict[int, str]:
     slices: dict[int, str] = {}
     starts = {location.chapter_id: location.start for location in locations}
+    aliases = set(load_sensitive_word_map().values())
 
     for index, (chapter_id, _) in enumerate(chapters):
         start = starts[chapter_id]
@@ -220,6 +228,7 @@ def slice_chapter_transcripts(
         end = starts[next_id] if next_id is not None else len(transcript)
         if end <= start:
             end = len(transcript)
+        start, end = adjust_span_to_alias_boundary(transcript, start, end, aliases)
         slices[chapter_id] = transcript[start:end].strip()
 
     return slices
@@ -257,6 +266,8 @@ def call_chat(
     max_tokens: int,
     max_continuations: int = 3,
 ) -> ChatResult:
+    word_map = load_sensitive_word_map()
+    filtered_user_prompt = encrypt_text(user_prompt, word_map)
     messages = [
         {
             "role": "system",
@@ -264,7 +275,7 @@ def call_chat(
         },
         {
             "role": "user",
-            "content": user_prompt,
+            "content": filtered_user_prompt,
         },
     ]
     chunks: list[str] = []
@@ -282,8 +293,10 @@ def call_chat(
         chunks.append(content)
 
         if finish_reason not in TRUNCATED_FINISH_REASONS:
+            filtered_content = strip_markdown_fence("\n".join(chunks))
+            assert_no_alias_fragments(filtered_content, word_map)
             return ChatResult(
-                content=strip_markdown_fence("\n".join(chunks)),
+                content=decrypt_text(filtered_content, word_map),
                 finish_reason=finish_reason,
                 continuations=continuation_count,
             )
@@ -923,11 +936,23 @@ def main() -> None:
     locations_path = out / "outline_locations.json"
     if args.resume and locations_path.exists():
         print(f"Pass 1.2: reusing chapter locations {locations_path}")
-        locations = parse_chapter_locations(
-            locations_path.read_text(encoding="utf-8"),
-            transcript,
-            chapters,
-        )
+        try:
+            locations = parse_chapter_locations(
+                locations_path.read_text(encoding="utf-8"),
+                transcript,
+                chapters,
+            )
+        except Exception as exc:
+            print(
+                "Pass 1.2: existing chapter locations were invalid, regenerating "
+                f"({exc})"
+            )
+            locations = call_location_pass_windowed(
+                client,
+                prompt_template,
+                transcript,
+                chapters,
+            )
     else:
         print("Pass 1.2: locating chapter starts...")
         locations = call_location_pass_windowed(
