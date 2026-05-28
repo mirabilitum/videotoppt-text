@@ -5,36 +5,15 @@ import os
 
 from openai import OpenAI
 
-from outline_granularity import (
-    build_granularity_plan_from_locations,
-    format_granularity_plan,
-)
 from outline_models import (
     ChatResult,
-    GranularityPlan,
     OutlinePolicy,
     PolicyMergeResult,
-    SkeletonGenerationResult,
-    SkeletonRepairError,
 )
 from outline_policy import (
     find_direct_policy_cover,
     format_outline_policy,
     parse_outline_policy,
-)
-from outline_skeleton import (
-    apply_course_title,
-    build_skeleton_prompt,
-    cap_heading_depths,
-    collect_granularity_failures,
-    normalize_anchored_skeleton,
-    parse_chapters,
-    parse_skeleton_anchor_locations,
-    policy_anchor_expectations,
-    repair_skeleton_anchors_from_policy,
-    strip_skeleton_anchors,
-    validate_skeleton_anchors_against_policy,
-    validate_skeleton_matches_granularity,
 )
 from outline_text import env_float, env_int, strip_markdown_fence
 from text_filter import assert_no_alias_fragments, decrypt_text, encrypt_text, load_sensitive_word_map
@@ -103,6 +82,7 @@ def call_chat(
         f"{max_continuations} continuation request(s)."
     )
 
+
 def call_outline_policy_pass(client: OpenAI, prompt_template: str, transcript: str) -> OutlinePolicy:
     user_prompt = f"""{prompt_template.strip()}
 
@@ -114,11 +94,11 @@ def call_outline_policy_pass(client: OpenAI, prompt_template: str, transcript: s
 - 先用 `course_structure_summary` 用一段话说明这份逐字稿整体讲了什么、按什么顺序展开。
 - 再用 `ordered_blocks` 按逐字稿讲授顺序列出主要内容块；每个 block 必须说明覆盖范围、作用和开头原文脚注。
 - `start_quote` 必须逐字复制自该内容块开头附近的逐字稿，帮助 merge 判断先后和来源；不要改写、概括或使用标题文本。
-- `candidate_top_level_items` 是你认为可作为 `##` 的候选章节；`top_level_items` 是后续 Pass 1 必须使用的最终 `##` 章节。
+- `candidate_top_level_items` 是你认为可作为 `##` 的候选章节；`top_level_items` 是后续章节生成必须使用的最终 `##` 章节。
 - `top_level_items` 顺序必须遵循逐字稿讲授顺序，并能从 `ordered_blocks` 推导出来。
 - 如果课程围绕教材单元逐一解读，`top_level_items` 优先使用教材单元和独立综合实践活动。
 - 短暂总述、过渡、跨单元关联说明、整体结构说明，不要放入 `top_level_items`；在 `merge_policy` 中说明它们应并入哪个相邻单元。
-- 对讲解结构相似的连续单元，在 `parallel_groups` 中列出这些单元名称，供后续生成平行 `###` 目录。
+- 对讲解结构相似的连续单元，在 `parallel_groups` 中列出这些单元名称，供后续生成平行子节结构。
 - 章节名称要准确、简洁，优先使用逐字稿中的教材单元名、活动名或讲师明确说出的板块名。
 - 必须包含课程开头的整体说明章节和结尾致谢/结束语章节（如果逐字稿中存在）。
 - 只输出一个 JSON 对象，不要输出 Markdown，不要解释。
@@ -177,6 +157,7 @@ JSON 输出格式：
     )
     return parse_outline_policy(result.content)
 
+
 def call_outline_policy_merge_pass(
     client: OpenAI,
     prompt_template: str,
@@ -200,7 +181,7 @@ def call_outline_policy_merge_pass(
 - `top_level_items` 必须覆盖所有 policy run 中出现的实质性顶级要点，但语义重复、同义改写、粗细粒度重叠的条目只能保留一次。
 - 如果一个 policy 的粗粒度章节包含另一个 policy 的多个细粒度章节，必须在 `merge_trace` 中说明拆分/包含关系；不要机械取标题并集。
 - `top_level_items` 的顺序必须按逐字稿讲授顺序排列，不要按某个 policy 的原始顺序机械拼接。
-- 不要根据后续 granularity、字数阈值或填充便利性决定是否增删顶级章节；这里只处理 policy 并集。
+- 不要根据字数阈值或填充便利性决定是否增删顶级章节；这里只处理 policy 并集。
 - `merge_policy` 必须合并所有 policy run 中关于总述、过渡、跨单元说明应如何并入相邻章节的规则。
 - `parallel_groups` 必须覆盖所有 policy run 中有价值的平行结构提示，语义重复的分组只保留一次。
 - 必须输出 `merge_trace`，说明每个 canonical 顶级章节来自哪些 policy run / block / candidate item。
@@ -265,6 +246,7 @@ JSON 输出格式：
     )
     return parse_outline_policy(result.content)
 
+
 def merge_outline_policy_runs(
     client: OpenAI,
     prompt_template: str,
@@ -291,366 +273,6 @@ def merge_outline_policy_runs(
         source_run=None,
     )
 
-def call_skeleton_pass(
-    client: OpenAI,
-    prompt_template: str,
-    transcript: str,
-    policy: OutlinePolicy | None = None,
-    granularity_plan: GranularityPlan | None = None,
-) -> str:
-    user_prompt = build_skeleton_prompt(prompt_template, transcript, policy, granularity_plan)
-    result = call_chat(
-        client,
-        user_prompt=user_prompt,
-        max_tokens=env_int("OUTLINE_SKELETON_MAX_TOKENS", 8192),
-        max_continuations=env_int("OUTLINE_SKELETON_MAX_CONTINUATIONS", 3),
-    )
-    skeleton = normalize_anchored_skeleton(result.content)
-
-    if result.continuations:
-        print(f"Pass 1 continuation requests={result.continuations}")
-    return skeleton
-
-def call_anchor_repair_pass(
-    client: OpenAI,
-    prompt_template: str,
-    anchored_skeleton: str,
-    policy: OutlinePolicy,
-    validation_error: str,
-) -> str:
-    expected_items = [
-        {
-            "chapter_id": item["chapter_id"],
-            "title": item["title"],
-            "start_quote": item["start_quote"],
-        }
-        for item in policy_anchor_expectations(policy)
-    ]
-    user_prompt = f"""{prompt_template.strip()}
-
----
-
-This is Pass 1 anchor repair. Only repair top-level chapters and anchors.
-
-Previous validation error:
-{validation_error}
-
-Hard requirements:
-- Output only a complete anchored Markdown skeleton. Do not add explanations.
-- The final `##` count, order, and meaning must match expected_policy_items exactly.
-- Each `##` must be followed immediately by one `outline-anchor` HTML comment.
-- Each anchor `start_quote` must use the exact value from expected_policy_items.
-- You may add missing `##` headings, but do not add any `##` outside expected_policy_items.
-- Do not fill transcript body text.
-
-expected_policy_items:
-```json
-{json.dumps(expected_items, ensure_ascii=False, indent=2)}
-```
-
-Current anchored skeleton:
-```markdown
-{anchored_skeleton.strip()}
-```"""
-    result = call_chat(
-        client,
-        user_prompt=user_prompt,
-        max_tokens=env_int("OUTLINE_ANCHOR_REPAIR_MAX_TOKENS", 8192),
-        max_continuations=env_int("OUTLINE_ANCHOR_REPAIR_MAX_CONTINUATIONS", 2),
-    )
-    return normalize_anchored_skeleton(result.content)
-
-def call_granularity_repair_pass(
-    client: OpenAI,
-    prompt_template: str,
-    anchored_skeleton: str,
-    granularity_plan: GranularityPlan,
-    failures: list[dict[str, object]],
-) -> str:
-    user_prompt = f"""{prompt_template.strip()}
-
----
-
-This is Pass 1 granularity repair. Only add necessary `###` headings inside failed chapters.
-
-Hard requirements:
-- Output only a complete anchored Markdown skeleton. Do not add explanations.
-- Do not modify `#`, any `##` heading, `##` order, or any `outline-anchor` comment.
-- Only add the necessary direct `###` headings for chapters listed in failed_chapters.
-- Each failed chapter must have at least `min_subsections` direct `###` headings.
-- Do not add, delete, merge, split, or reorder `##` headings.
-- Do not fill transcript body text.
-
-failed_chapters:
-```json
-{json.dumps(failures, ensure_ascii=False, indent=2)}
-```
-
-Full granularity plan:
-```json
-{json.dumps(granularity_plan, ensure_ascii=False, indent=2)}
-```
-
-Current anchored skeleton:
-```markdown
-{anchored_skeleton.strip()}
-```"""
-    result = call_chat(
-        client,
-        user_prompt=user_prompt,
-        max_tokens=env_int("OUTLINE_SKELETON_REPAIR_MAX_TOKENS", 8192),
-        max_continuations=env_int("OUTLINE_SKELETON_REPAIR_MAX_CONTINUATIONS", 2),
-    )
-    return normalize_anchored_skeleton(result.content)
-
-def split_transcript_chunks(
-    transcript: str,
-    chunk_size: int,
-    overlap: int,
-) -> list[str]:
-    if chunk_size <= 0:
-        raise ValueError("SKELETON_CHUNK_CHARS must be a positive integer.")
-    if overlap < 0:
-        raise ValueError("SKELETON_CHUNK_OVERLAP must be 0 or a positive integer.")
-    if overlap >= chunk_size:
-        raise ValueError("SKELETON_CHUNK_OVERLAP must be smaller than chunk size.")
-
-    chunks: list[str] = []
-    start = 0
-    while start < len(transcript):
-        end = min(len(transcript), start + chunk_size)
-        chunks.append(transcript[start:end])
-        if end >= len(transcript):
-            break
-        start = end - overlap
-    return chunks
-
-def call_skeleton_merge_pass(
-    client: OpenAI,
-    sub_skeletons: list[str],
-    policy: OutlinePolicy | None = None,
-    granularity_plan: GranularityPlan | None = None,
-) -> str:
-    combined = "\n\n---\n\n".join(
-        f"子骨架 {index + 1}：\n\n{skeleton.strip()}"
-        for index, skeleton in enumerate(sub_skeletons)
-    )
-    policy_block = ""
-    if policy:
-        policy_block = f"""
-
-顶级章节策略（必须遵守）：
-```json
-{format_outline_policy(policy)}
-```
-
-合并后的最终 `##` 必须与 `top_level_items` 数量、顺序和含义一致，不要新增、删除、重排或拆分 `##`。
-"""
-    granularity_block = ""
-    if granularity_plan:
-        granularity_block = f"""
-
-章节细分计划（必须遵守）：
-```json
-{format_granularity_plan(granularity_plan)}
-```
-
-每个 `##` 下的 `###` 数量必须不少于对应 `min_subsections`。`min_subsections=0` 的短章节可以不拆分。
-"""
-    user_prompt = f"""这是 Pass 1 合并：把多个按原文顺序生成的课程大纲子骨架合并为一个最终骨架。
-
-硬性要求：
-- 只输出 Markdown 大纲结构，不填充任何逐字稿原文。
-- 使用 `#` 输出唯一课程主题。
-- 使用 `##` 输出顶级章节；默认后续层级使用 `###`，确有必要时可用 `####`，最多四级。
-- 每个 `##` 标题下一行必须紧跟一个 HTML 注释锚点：`<!-- outline-anchor: {{"chapter_id": 1, "start_quote": "从逐字稿逐字复制的该章开头短句"}} -->`。
-- `chapter_id` 必须等于最终 `##` 的 1-based 顺序；`start_quote` 必须逐字复制自该章实际开始处的逐字稿。
-- 不得输出 `#####` 或更深层级；例题、步骤或条目优先合并进相邻 `###` 标题，只有长章节内部需要稳定路牌时才使用 `####`。
-- 如果课程围绕教材单元展开，最终 `##` 优先对应教材单元或独立综合实践活动。
-- 不要把短暂总述、过渡、跨单元关联说明单独升成 `##`；把它并入紧随其后的第一个真实教材单元下的 `###`。
-- 连续相似单元应使用平行的 `###` 目录结构，不要把某个单元的“解决问题”“整理复习”等局部内容抽成独立 `##`。
-- 保持子骨架出现的原始顺序。
-- 只允许删除或合并重复章节、统一层级和清理重复标题。
-- 不允许新增未出现在子骨架中的章节。
-- 不要输出说明、分析或代码围栏。
-{policy_block}
-{granularity_block}
-
-待合并子骨架：
-
-{combined}"""
-    result = call_chat(
-        client,
-        user_prompt=user_prompt,
-        max_tokens=env_int("OUTLINE_SKELETON_MERGE_MAX_TOKENS", 8192),
-        max_continuations=env_int("OUTLINE_SKELETON_MERGE_MAX_CONTINUATIONS", 3),
-    )
-    if result.continuations:
-        print(f"Pass 1 merge continuation requests={result.continuations}")
-    return normalize_anchored_skeleton(result.content)
-
-def call_skeleton_pass_chunked(
-    client: OpenAI,
-    prompt_template: str,
-    transcript: str,
-    chunk_size: int,
-    overlap: int,
-    policy: OutlinePolicy | None = None,
-    granularity_plan: GranularityPlan | None = None,
-) -> str:
-    chunks = split_transcript_chunks(transcript, chunk_size, overlap)
-    sub_skeletons: list[str] = []
-    for index, chunk in enumerate(chunks, start=1):
-        print(f"Pass 1: generating chunk skeleton {index}/{len(chunks)} chars={len(chunk)}")
-        sub_skeletons.append(
-            call_skeleton_pass(client, prompt_template, chunk, policy, granularity_plan)
-        )
-    print(f"Pass 1: merging {len(sub_skeletons)} chunk skeletons...")
-    return call_skeleton_merge_pass(client, sub_skeletons, policy, granularity_plan)
-
-def generate_skeleton_from_policy(
-    client: OpenAI,
-    prompt_template: str,
-    transcript: str,
-    course_title: str | None,
-    policy: OutlinePolicy,
-    granularity_plan: GranularityPlan | None,
-    char_count: int,
-) -> str:
-    chunk_threshold = env_int("OUTLINE_SKELETON_CHUNK_THRESHOLD", 30000)
-    if char_count > chunk_threshold:
-        skeleton = call_skeleton_pass_chunked(
-            client,
-            prompt_template,
-            transcript,
-            env_int("OUTLINE_SKELETON_CHUNK_CHARS", 15000),
-            env_int("OUTLINE_SKELETON_CHUNK_OVERLAP", 500),
-            policy,
-            granularity_plan,
-        )
-    else:
-        skeleton = call_skeleton_pass(client, prompt_template, transcript, policy, granularity_plan)
-    return apply_course_title(skeleton, course_title)
-
-def generate_skeleton_with_granularity(
-    client: OpenAI,
-    prompt_template: str,
-    transcript: str,
-    course_title: str | None,
-    policy: OutlinePolicy,
-    char_count: int,
-) -> SkeletonGenerationResult:
-    print("Pass 1: generating outline skeleton from canonical policy...")
-    retry_report: dict[str, object] = {
-        "status": "valid",
-        "anchor_repair_count": 0,
-        "granularity_repair_count": 0,
-        "anchor_error": "",
-        "granularity_repair_chapters": [],
-    }
-
-    def fail(status: str, message: str) -> None:
-        retry_report["status"] = status
-        raise SkeletonRepairError(message, status=status, retry_report=retry_report)
-
-    anchored_skeleton = generate_skeleton_from_policy(
-        client,
-        prompt_template,
-        transcript,
-        course_title,
-        policy,
-        granularity_plan=None,
-        char_count=char_count,
-    )
-
-    try:
-        validate_skeleton_anchors_against_policy(anchored_skeleton, transcript, policy)
-        anchored_skeleton = repair_skeleton_anchors_from_policy(anchored_skeleton, policy)
-        validate_skeleton_anchors_against_policy(anchored_skeleton, transcript, policy)
-    except RuntimeError as exc:
-        retry_report["anchor_error"] = str(exc)
-        anchor_ok = False
-        try:
-            anchored_skeleton = repair_skeleton_anchors_from_policy(anchored_skeleton, policy)
-            retry_report["anchor_repair_count"] = int(retry_report["anchor_repair_count"]) + 1
-            validate_skeleton_anchors_against_policy(anchored_skeleton, transcript, policy)
-            anchor_ok = True
-        except RuntimeError as deterministic_exc:
-            retry_report["anchor_error"] = str(deterministic_exc)
-
-        anchor_llm_attempts = 0
-        max_anchor_repairs = max(0, env_int("OUTLINE_ANCHOR_REPAIR_MAX_ATTEMPTS", 2))
-        while not anchor_ok and anchor_llm_attempts < max_anchor_repairs:
-            anchored_skeleton = call_anchor_repair_pass(
-                client,
-                prompt_template,
-                anchored_skeleton,
-                policy,
-                str(retry_report["anchor_error"]),
-            )
-            anchor_llm_attempts += 1
-            retry_report["anchor_repair_count"] = int(retry_report["anchor_repair_count"]) + 1
-            try:
-                anchored_skeleton = repair_skeleton_anchors_from_policy(anchored_skeleton, policy)
-                validate_skeleton_anchors_against_policy(anchored_skeleton, transcript, policy)
-                anchor_ok = True
-            except RuntimeError as anchor_retry_exc:
-                retry_report["anchor_error"] = str(anchor_retry_exc)
-
-        if not anchor_ok:
-            fail("ANCHOR_FAIL", f"Skeleton anchor repair failed: {retry_report['anchor_error']}")
-
-    _, _, locations = parse_skeleton_anchor_locations(anchored_skeleton, transcript)
-    clean_skeleton = strip_skeleton_anchors(anchored_skeleton)
-    granularity_plan = build_granularity_plan_from_locations(
-        transcript,
-        parse_chapters(clean_skeleton)[1],
-        locations,
-    )
-
-    max_granularity_repairs = max(0, env_int("OUTLINE_GRANULARITY_REPAIR_MAX_ATTEMPTS", 2))
-    while True:
-        _, chapters = parse_chapters(strip_skeleton_anchors(anchored_skeleton))
-        failures = collect_granularity_failures(chapters, granularity_plan)
-        if not failures:
-            break
-        if not retry_report["granularity_repair_chapters"]:
-            retry_report["granularity_repair_chapters"] = failures
-        if int(retry_report["granularity_repair_count"]) >= max_granularity_repairs:
-            fail(
-                "GRANULARITY_FAIL",
-                "Skeleton granularity repair failed after "
-                f"{max_granularity_repairs} attempt(s): {failures}",
-            )
-        anchored_skeleton = call_granularity_repair_pass(
-            client,
-            prompt_template,
-            anchored_skeleton,
-            granularity_plan,
-            failures,
-        )
-        retry_report["granularity_repair_count"] = (
-            int(retry_report["granularity_repair_count"]) + 1
-        )
-        try:
-            validate_skeleton_anchors_against_policy(anchored_skeleton, transcript, policy)
-        except RuntimeError as exc:
-            retry_report["anchor_error"] = str(exc)
-            fail(
-                "ANCHOR_FAIL",
-                f"Skeleton anchor validation failed during granularity repair: {exc}",
-            )
-
-    _, chapters, locations = parse_skeleton_anchor_locations(anchored_skeleton, transcript)
-    clean_skeleton = strip_skeleton_anchors(anchored_skeleton)
-    validate_skeleton_matches_granularity(chapters, granularity_plan)
-    return SkeletonGenerationResult(
-        skeleton=clean_skeleton,
-        anchored_skeleton=anchored_skeleton,
-        granularity_plan=granularity_plan,
-        locations=locations,
-        retry_report=retry_report,
-    )
 
 def call_intro_pass(
     client: OpenAI,
@@ -684,48 +306,63 @@ def call_intro_pass(
     )
     return strip_markdown_fence(result.content).strip()
 
-def call_fill_chapter(
+
+_CHINESE_NUMERALS = ["一","二","三","四","五","六","七","八","九","十",
+                     "十一","十二","十三","十四","十五","十六","十七","十八","十九","二十"]
+
+def _chapter_numeral(chapter_id: int) -> str:
+    if 1 <= chapter_id <= len(_CHINESE_NUMERALS):
+        return _CHINESE_NUMERALS[chapter_id - 1]
+    return str(chapter_id)
+
+
+def call_fill_chapter_draft(
     client: OpenAI,
-    fill_prompt: str,
-    outline_subtree: str,
-    chapter_transcript: str,
+    prompt_template: str,
     chapter_id: int,
     chapter_count: int,
+    chapter_title: str,
+    chapter_transcript: str,
+    course_structure_summary: str,
+    chapter_map: list[dict[str, str]],
 ) -> str:
-    user_prompt = f"""{fill_prompt.strip()}
+    numeral = _chapter_numeral(chapter_id)
+    chapter_map_text = "\n".join(
+        f"- [{item['block_id']}] {item['title']}：{item['scope_summary']}"
+        for item in chapter_map
+    )
+    user_prompt = f"""{prompt_template.strip()}
 
 ---
 
-这是 Pass 2：只填充指定顶级章节。
+这是 Pass 2a：对当前章节逐字稿进行话题分段，输出分段结果供后续节点生成使用。
 
-硬性要求：
-- 只处理下面给出的”当前章节大纲子树”，不要输出其他章节。
-- 不修改当前章节大纲结构，不新增、删除、合并、重排标题。
-- 保持当前章节大纲层级，不新增标题，不得使用 `#####` 或更深层级。
-- 如果当前章节大纲子树没有 `####`，输出时也不要新增 `####`；标题只是稀疏路牌，不是细颗粒摘要。
-- 逐字稿原文是主体，保持连续流动，不加 `>` 引用块。
-- 将当前章节大纲子树的各级标题，作为路牌按讲授顺序插入原文对应位置。
-- 标题插在对应内容开始之前，原文紧跟在标题后自然流动。
-- 不要新增当前章节大纲子树中不存在的标题层级；如果子树没有 `####`，不得自行添加 `####`。
-- 如果某段原文无法细化到末级节点，保留在最近的上级标题之后即可。
-- 原文必须逐字保留，不改写、不总结、不润色。
-- 原文不要跨章节重复；明显属于其他章节的内容不要填入当前章节。
-- 输出纯 Markdown，不要包裹代码围栏。
+全课结构摘要：
+{course_structure_summary.strip()}
+
+全课章节地图（仅供定位）：
+{chapter_map_text}
+
+分段规则：
+- 识别讲师的话题切换信号，包括但不限于："那么接下来"、"好，下面"、"第X个话题"、"那第X点"、"然后我们看"、"关于X"等口语转折词，以及明显的内容主题跳转。
+- 每个段落必须包含至少 100 个汉字的实质性内容；不足 100 字的碎片（过渡语、致谢、停顿填充词）并入前一个段落。
+- 不要因为讲师说了"话题一"、"话题二"就机械分段，要判断实际内容是否构成独立的讲授话题。
+- 输出格式为 JSON 数组，每个元素包含：
+  - `seg_id`：从 1 开始的段落编号
+  - `topic`：一句话说明本段的核心讲授内容（10-20 字）
+  - `text`：本段逐字稿原文，逐字保留不改写
+
+只输出 JSON 数组，不要输出其他内容。
 
 当前章节：{chapter_id}/{chapter_count}
+当前章节标题：{chapter_title}
 
-当前章节大纲子树：
-
-```markdown
-{outline_subtree.strip()}
-```
-
-当前章节候选逐字稿：
+当前章节逐字稿：
 
 ```text
 {chapter_transcript.strip()}
 ```"""
-    dynamic_max = min(16384, max(8192, int(len(chapter_transcript) * 0.8) + 2048))
+    dynamic_max = min(16384, max(8192, int(len(chapter_transcript) * 1.2) + 2048))
     result = call_chat(
         client,
         user_prompt=user_prompt,
@@ -733,5 +370,53 @@ def call_fill_chapter(
         max_continuations=env_int("OUTLINE_FILL_MAX_CONTINUATIONS", 3),
     )
     if result.continuations:
-        print(f"Pass 2 chapter {chapter_id} continuation requests={result.continuations}")
-    return cap_heading_depths(strip_markdown_fence(result.content))
+        print(f"Pass 2a chapter {chapter_id} continuation requests={result.continuations}")
+    return strip_markdown_fence(result.content)
+
+
+def call_fill_chapter_merge(
+    client: OpenAI,
+    prompt_template: str,
+    chapter_id: int,
+    chapter_count: int,
+    draft: str,
+) -> str:
+    numeral = _chapter_numeral(chapter_id)
+    user_prompt = f"""{prompt_template.strip()}
+
+---
+
+这是 Pass 2b：根据分段结果生成章节 Markdown，包含结构节点和逐字稿原文。
+
+输入是一个 JSON 数组，每个元素包含 seg_id、topic（段落主题）、text（逐字稿原文）。
+
+节点生成规则：
+- 只输出当前章节，从 `##` 标题开始。
+- `##` 标题格式固定为：`## {numeral}、章节标题文字`，不得修改标题文字。
+- 根据各段的 topic 和内容判断节点结构：
+  - 内容独立、主题明显不同的段落各自生成 `###` 节点。
+  - 语义相近、内容连贯的相邻段落合并为同一 `###` 节点，节点标题概括合并后的完整内容。
+  - 单个 `###` 节点内容丰富、可明显细分为多个子话题时，拆成 `####` 子节点。
+- `###` 编号格式：`{chapter_id}.1`、`{chapter_id}.2`……依序递增，不得跳号。
+- `####` 编号格式：在各自父节点下从 `{chapter_id}.X.1` 开始依序递增，不得跳号。
+- 标题层级最深到 `####`，不得使用 `#####` 或更深层级。
+- 逐字稿原文必须逐字保留，不改写、不总结、不润色，保持连续流动，不加 `>` 引用块。
+- 输出纯 Markdown，不要包裹代码围栏。
+
+当前章节：{chapter_id}/{chapter_count}
+
+分段结果：
+
+```json
+{draft.strip()}
+```"""
+    dynamic_max = min(16384, max(8192, int(len(draft) * 1.2) + 2048))
+    result = call_chat(
+        client,
+        user_prompt=user_prompt,
+        max_tokens=env_int("OUTLINE_MERGE_MAX_TOKENS", dynamic_max),
+        max_continuations=env_int("OUTLINE_MERGE_MAX_CONTINUATIONS", 3),
+    )
+    if result.continuations:
+        print(f"Pass 2b chapter {chapter_id} continuation requests={result.continuations}")
+    return strip_markdown_fence(result.content)

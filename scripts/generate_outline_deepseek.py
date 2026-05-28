@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import re
+from bisect import bisect_left
 from pathlib import Path
 
 from openai import OpenAI
@@ -11,7 +11,6 @@ from openai import OpenAI
 from common import load_config, output_dir
 from outline_io import (
     DEFAULT_PROMPT_PATH,
-    file_sha256,
     outline_complete,
     outline_inputs_match,
     outline_policy_path,
@@ -24,87 +23,28 @@ from outline_io import (
     sha256_text,
     write_outline_source,
 )
-from outline_granularity import (
-    build_granularity_plan_from_locations,
-    build_granularity_plan_from_skeleton,
-    build_policy_granularity_plan,
-    format_granularity_plan,
-    min_subsections_for_chars,
-)
-from outline_experiment import (
-    run_skeleton_only_experiment,
-    write_skeleton_experiment_manifest,
-)
-from outline_locations import (
-    find_anchor_quote_start,
-    find_heading_start,
-    find_quote_start,
-    format_chapter_locations,
-    heading_search_terms,
-    parse_chapter_locations,
-    read_legacy_chapter_locations,
-    slice_chapter_transcripts,
-    validate_anchor_chapter_locations,
-    validate_chapter_locations,
-    validate_final_chapter_locations,
-)
 from outline_models import (
-    ChatResult,
     ChapterLocation,
-    GranularityPlan,
     OutlinePolicy,
-    SkeletonGenerationResult,
-    TranscriptSource,
 )
 from outline_llm import (
     call_chat,
-    call_fill_chapter,
+    call_fill_chapter_draft,
+    call_fill_chapter_merge,
     call_intro_pass,
     call_outline_policy_pass,
-    call_skeleton_merge_pass,
-    call_skeleton_pass,
-    call_skeleton_pass_chunked,
-    generate_skeleton_from_policy,
-    generate_skeleton_with_granularity,
     merge_outline_policy_runs,
-    split_transcript_chunks,
 )
 from outline_text import (
-    HEADING_RE,
-    ROOT_HEADING_RE,
-    chapter_heading,
-    compact_text,
     env_float,
     env_int,
-    find_first,
     normalize_with_index,
-    strip_heading_number,
     strip_markdown_fence,
 )
 from outline_policy import (
     format_outline_policy,
-    normalize_outline_policy,
-    normalize_parallel_groups,
-    normalize_policy_heading_key,
-    normalize_policy_items,
-    parse_json_object,
-    parse_outline_policy,
     read_outline_policy,
     write_outline_policy,
-)
-from outline_skeleton import (
-    ANCHOR_RE,
-    apply_course_title,
-    attach_skeleton_anchors,
-    build_skeleton_prompt,
-    cap_heading_depths,
-    normalize_anchored_skeleton,
-    normalize_skeleton,
-    parse_chapters,
-    parse_skeleton_anchor_locations,
-    strip_skeleton_anchors,
-    validate_skeleton_matches_granularity,
-    validate_skeleton_matches_policy,
 )
 from text_filter import (
     decrypt_text,
@@ -113,28 +53,27 @@ from text_filter import (
 )
 
 MODEL_DEFAULT = "deepseek-chat"
-SYSTEM_PROMPT = "你是一名专业的课程内容分析师，擅长从课程转写文本中提取结构化大纲。"
-TRUNCATED_FINISH_REASONS = {"length", "max_tokens"}
+
+
+def strip_part_markers(transcript: str) -> str:
+    return re.sub(r"\[Part \d+\]\s*", "", transcript)
 
 
 def clip_intro_to_first_chapter(intro: str, transcript: str, first_chapter_start: int) -> str:
     if first_chapter_start <= 0:
         return intro.strip()
-
     expected_intro = transcript[:first_chapter_start].strip()
     if not expected_intro:
         return ""
-
-    if not intro.strip() or len(compact_text(intro)) > len(compact_text(expected_intro)):
+    if not intro.strip():
         return expected_intro
-
     return intro.strip()
 
 
 def merge_outline(title: str, intro: str, filled_chapters: list[str]) -> str:
     clean_title = title.strip()
     clean_intro = intro.strip()
-    clean_chapters = [chapter.strip() for chapter in filled_chapters if chapter.strip()]
+    clean_chapters = [c.strip() for c in filled_chapters if c.strip()]
     parts = [clean_title]
     if clean_intro:
         parts.append(clean_intro)
@@ -142,18 +81,100 @@ def merge_outline(title: str, intro: str, filled_chapters: list[str]) -> str:
     return "\n\n".join(parts) + "\n"
 
 
-def strip_part_markers(transcript: str) -> str:
-    return re.sub(r"\[Part \d+\]\s*", "", transcript)
+def find_quote_start(text: str, quote: str, start: int = 0) -> int:
+    exact = text.find(quote, start)
+    if exact >= 0:
+        return exact
+    normalized_text, index_map = normalize_with_index(text)
+    normalized_quote, _ = normalize_with_index(quote)
+    if not normalized_quote or not index_map:
+        return -1
+    normalized_start = bisect_left(index_map, start)
+    pos = normalized_text.find(normalized_quote, normalized_start)
+    if pos < 0:
+        return -1
+    return index_map[pos]
 
 
-def parse_args() -> argparse.Namespace:
+def locate_chapters(
+    transcript: str,
+    policy: OutlinePolicy,
+) -> list[ChapterLocation]:
+    candidate_blocks = [
+        b for b in policy.get("ordered_blocks", [])
+        if isinstance(b, dict) and bool(b.get("candidate_top_level"))
+    ]
+    top_level_items = [
+        str(item).strip()
+        for item in policy.get("top_level_items", [])
+        if str(item).strip()
+    ]
+    n = len(top_level_items)
+    blocks = candidate_blocks[:n]
+
+    locations: list[ChapterLocation] = []
+    search_from = 0
+    for i, (title, block) in enumerate(zip(top_level_items, blocks)):
+        chapter_id = i + 1
+        start_quote = str(block.get("start_quote") or "").strip()
+        if not start_quote:
+            raise RuntimeError(
+                f"Missing start_quote for chapter {chapter_id}: {title!r}"
+            )
+        pos = find_quote_start(transcript, start_quote, search_from)
+        if pos < 0:
+            raise RuntimeError(
+                f"start_quote for chapter {chapter_id} not found after previous chapter: "
+                f"{start_quote!r}"
+            )
+        locations.append(ChapterLocation(
+            chapter_id=chapter_id,
+            heading=title,
+            start_quote=start_quote,
+            start=pos,
+            source="policy",
+        ))
+        search_from = pos + len(start_quote)
+    return locations
+
+
+def slice_chapter_transcripts(
+    transcript: str,
+    locations: list[ChapterLocation],
+) -> dict[int, str]:
+    result: dict[int, str] = {}
+    for i, loc in enumerate(locations):
+        end = locations[i + 1].start if i + 1 < len(locations) else len(transcript)
+        result[loc.chapter_id] = transcript[loc.start:end]
+    return result
+
+
+def format_chapter_locations(locations: list[ChapterLocation]) -> str:
+    return json.dumps(
+        [
+            {
+                "chapter_id": loc.chapter_id,
+                "heading": loc.heading,
+                "start_quote": loc.start_quote,
+                "start": loc.start,
+                "source": loc.source,
+            }
+            for loc in locations
+        ],
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+def parse_args():
+    import argparse
     parser = argparse.ArgumentParser(
         description="Generate a structured course outline from transcript.txt."
     )
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Reuse existing outline_skeleton.md, outline_intro.md, and chapter files.",
+        help="Reuse existing chapter files and intro where inputs match.",
     )
     parser.add_argument(
         "--rerun-from",
@@ -168,21 +189,10 @@ def parse_args() -> argparse.Namespace:
         help="Transcript input source. auto prefers transcript_clean.txt when present.",
     )
     parser.add_argument(
-        "--skeleton-only",
-        action="store_true",
-        help="Stop after Pass 0 and Pass 1 for policy/skeleton stability experiments.",
-    )
-    parser.add_argument(
         "--policy-runs",
         type=int,
         default=2,
         help="Generate this many independent policies before canonical policy merge.",
-    )
-    parser.add_argument(
-        "--skeleton-runs",
-        type=int,
-        default=1,
-        help="With --skeleton-only, generate this many skeletons per policy.",
     )
     return parser.parse_args()
 
@@ -212,10 +222,6 @@ def main() -> None:
     print(f"transcript_source={transcript_source.name}")
     print(f"transcript_path={transcript_source.path}")
     print(f"transcript_chars={char_count}")
-    if char_count > 30000:
-        print(f"WARNING: transcript is long ({char_count} chars); chunked skeleton will be used")
-    elif char_count > 20000:
-        print(f"INFO: transcript is medium length ({char_count} chars)")
 
     client = OpenAI(
         api_key=api_key,
@@ -224,18 +230,7 @@ def main() -> None:
         max_retries=env_int("DEEPSEEK_MAX_RETRIES", 2),
     )
 
-    if args.skeleton_only:
-        run_skeleton_only_experiment(
-            client=client,
-            prompt_template=prompt_template,
-            transcript=transcript,
-            course_title=course_title,
-            out=out,
-            policy_runs=args.policy_runs,
-            skeleton_runs=args.skeleton_runs,
-        )
-        return
-
+    # Pass 0: policy
     policy_path = outline_policy_path(out)
     if reuse_existing and outline_source_policy_matches(out, policy_path):
         print(f"Pass 0: reusing outline policy {policy_path}")
@@ -259,85 +254,29 @@ def main() -> None:
         policy_merge = merge_outline_policy_runs(client, prompt_template, transcript, policy_runs)
         policy = policy_merge.policy
         if args.policy_runs > 1:
-            canonical_policy_path = out / "outline_policy_canonical.json"
-            canonical_policy_path.write_text(
+            (out / "outline_policy_canonical.json").write_text(
                 format_outline_policy(policy) + "\n",
                 encoding="utf-8",
             )
         print(f"Pass 0: canonical policy reason={policy_merge.reason}")
         write_outline_policy(out, policy)
         reuse_existing = False
-    granularity_path = out / "outline_granularity.json"
 
-    skeleton_path = out / "outline_skeleton.md"
-    anchored_skeleton_path = out / "outline_skeleton_anchored.md"
+    # locate chapters from policy
+    locations = locate_chapters(transcript, policy)
     locations_path = out / "outline_locations.json"
-    legacy_locations = False
-    if reuse_existing and anchored_skeleton_path.exists():
-        print(f"Pass 1: reusing anchored outline skeleton {anchored_skeleton_path}")
-        anchored_skeleton = anchored_skeleton_path.read_text(encoding="utf-8").strip()
-        titled_anchored_skeleton = apply_course_title(anchored_skeleton, course_title)
-        if titled_anchored_skeleton != anchored_skeleton:
-            anchored_skeleton = titled_anchored_skeleton
-            anchored_skeleton_path.write_text(anchored_skeleton + "\n", encoding="utf-8")
-        skeleton = strip_skeleton_anchors(anchored_skeleton)
-        _, chapters, locations = parse_skeleton_anchor_locations(anchored_skeleton, transcript)
-        granularity_plan = build_granularity_plan_from_locations(transcript, chapters, locations)
-        skeleton_path.write_text(skeleton + "\n", encoding="utf-8")
-    elif reuse_existing and skeleton_path.exists() and locations_path.exists():
-        print(f"Pass 1: reusing legacy outline skeleton {skeleton_path}")
-        skeleton = skeleton_path.read_text(encoding="utf-8").strip()
-        titled_skeleton = apply_course_title(skeleton, course_title)
-        if titled_skeleton != skeleton:
-            skeleton = titled_skeleton
-            skeleton_path.write_text(skeleton + "\n", encoding="utf-8")
-        _, chapters = parse_chapters(skeleton)
-        locations = read_legacy_chapter_locations(locations_path, transcript, chapters)
-        validate_final_chapter_locations(locations, len(transcript))
-        granularity_plan = build_granularity_plan_from_locations(transcript, chapters, locations)
-        legacy_locations = True
-    elif reuse_existing and skeleton_path.exists():
-        raise RuntimeError(
-            "Cannot resume from a clean outline_skeleton.md without "
-            "outline_skeleton_anchored.md or valid outline_locations.json. "
-            "Regenerate the skeleton to create anchors."
-        )
-    else:
-        print("Pass 1: generating outline skeleton...")
-        skeleton_result = generate_skeleton_with_granularity(
-            client,
-            prompt_template,
-            transcript,
-            course_title,
-            policy,
-            char_count,
-        )
-        skeleton = skeleton_result.skeleton
-        anchored_skeleton = skeleton_result.anchored_skeleton
-        granularity_plan = skeleton_result.granularity_plan
-        locations = skeleton_result.locations
-        anchored_skeleton_path.write_text(anchored_skeleton + "\n", encoding="utf-8")
-        skeleton_path.write_text(skeleton + "\n", encoding="utf-8")
-    granularity_path.write_text(format_granularity_plan(granularity_plan) + "\n", encoding="utf-8")
-
-    title, chapters = parse_chapters(skeleton)
-    if not chapters:
-        raise RuntimeError(f"No top-level chapters found in skeleton: {skeleton_path}")
-    validate_skeleton_matches_policy(chapters, policy)
-    validate_skeleton_matches_granularity(chapters, granularity_plan)
-
-    print(f"outline_skeleton.md={skeleton_path}")
-    print(f"outline_granularity.json={granularity_path}")
-    print(f"chapters={len(chapters)}")
-
-    if legacy_locations:
-        validate_final_chapter_locations(locations, len(transcript))
-    else:
-        validate_anchor_chapter_locations(locations, len(transcript))
     locations_path.write_text(format_chapter_locations(locations) + "\n", encoding="utf-8")
-    chapter_transcripts = slice_chapter_transcripts(transcript, chapters, locations)
+    chapter_transcripts = slice_chapter_transcripts(transcript, locations)
 
-    first_heading = chapters[0][1].splitlines()[0] if chapters[0][1].splitlines() else ""
+    top_level_items = [
+        str(item).strip()
+        for item in policy.get("top_level_items", [])
+        if str(item).strip()
+    ]
+    course_title_heading = f"# {course_title}" if course_title else "# 课程大纲"
+    first_heading = f"## {top_level_items[0]}" if top_level_items else ""
+
+    # Pass 1.5: intro
     intro_path = out / "outline_intro.md"
     if reuse_existing and intro_path.exists():
         print(f"Pass 1.5: reusing opening intro {intro_path}")
@@ -349,13 +288,32 @@ def main() -> None:
     intro = clip_intro_to_first_chapter(intro, transcript, locations[0].start)
     intro_path.write_text(intro + "\n", encoding="utf-8")
 
+    # build chapter map for context
+    candidate_blocks = [
+        b for b in policy.get("ordered_blocks", [])
+        if isinstance(b, dict) and bool(b.get("candidate_top_level"))
+    ]
+    n = len(top_level_items)
+    chapter_map = [
+        {
+            "block_id": str(b.get("block_id", f"C{i+1:02d}")),
+            "title": str(top_level_items[i]),
+            "scope_summary": str(b.get("scope_summary", "")),
+        }
+        for i, b in enumerate(candidate_blocks[:n])
+    ]
+    course_structure_summary = str(policy.get("course_structure_summary", ""))
+
+    # Pass 2a + 2b: fill chapters
     chapters_dir = out / "outline_chapters"
     chapters_dir.mkdir(parents=True, exist_ok=True)
-
     filled_chapters: list[str] = []
-    for chapter_id, chapter_subtree in chapters:
-        heading = chapter_subtree.splitlines()[0] if chapter_subtree.splitlines() else ""
+
+    for loc in locations:
+        chapter_id = loc.chapter_id
+        heading = f"## {loc.heading}"
         chapter_path = chapters_dir / f"outline_chapter_{chapter_id:03d}.md"
+        draft_path = chapters_dir / f"outline_chapter_{chapter_id:03d}_draft.md"
         should_reuse = (
             reuse_existing
             and chapter_path.exists()
@@ -363,23 +321,35 @@ def main() -> None:
             and (args.rerun_from <= 0 or chapter_id < args.rerun_from)
         )
         if should_reuse:
-            print(f"Pass 2: reusing chapter {chapter_id}/{len(chapters)} {heading}")
+            print(f"Pass 2: reusing chapter {chapter_id}/{len(locations)} {heading}")
             filled_chapters.append(chapter_path.read_text(encoding="utf-8").strip())
             continue
 
-        print(f"Pass 2: filling chapter {chapter_id}/{len(chapters)} {heading}")
-        filled = call_fill_chapter(
-            client,
-            prompt_template,
-            chapter_subtree,
-            chapter_transcripts[chapter_id],
-            chapter_id,
-            len(chapters),
+        print(f"Pass 2a: drafting chapter {chapter_id}/{len(locations)} {heading}")
+        draft = call_fill_chapter_draft(
+            client=client,
+            prompt_template=prompt_template,
+            chapter_id=chapter_id,
+            chapter_count=len(locations),
+            chapter_title=heading,
+            chapter_transcript=chapter_transcripts[chapter_id],
+            course_structure_summary=course_structure_summary,
+            chapter_map=chapter_map,
+        )
+        draft_path.write_text(draft + "\n", encoding="utf-8")
+
+        print(f"Pass 2b: merging chapter {chapter_id}/{len(locations)} {heading}")
+        filled = call_fill_chapter_merge(
+            client=client,
+            prompt_template=prompt_template,
+            chapter_id=chapter_id,
+            chapter_count=len(locations),
+            draft=draft,
         )
         chapter_path.write_text(filled + "\n", encoding="utf-8")
         filled_chapters.append(filled)
 
-    outline = merge_outline(title, intro, filled_chapters)
+    outline = merge_outline(course_title_heading, intro, filled_chapters)
     outline_path = out / "outline.md"
     outline_path.write_text(outline, encoding="utf-8")
     write_outline_source(
