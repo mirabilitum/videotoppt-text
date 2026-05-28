@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import uuid
 import unittest
@@ -7,7 +8,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
-TEST_ROOT = ROOT / ".codex_tmp" / "tests"
+TEST_ROOT = Path(os.getenv("CODEX_TEST_ROOT", str(ROOT / ".codex_tmp" / "tests")))
 TEST_ROOT.mkdir(parents=True, exist_ok=True)
 SCRIPTS = ROOT / "scripts"
 for path in (ROOT, SCRIPTS):

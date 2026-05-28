@@ -18,6 +18,17 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - import fallback for tests
     from .fetch_m3u8 import fetch_m3u8_urls
 
+try:
+    from clean_transcript import clean_complete
+    from generate_outline_deepseek import outline_complete
+    from infer_course_context import infer_context_complete, validate_grade_subject_args
+    from merge_transcripts import merge_clean_complete
+except ModuleNotFoundError:  # pragma: no cover - import fallback for tests
+    from .clean_transcript import clean_complete
+    from .generate_outline_deepseek import outline_complete
+    from .infer_course_context import infer_context_complete, validate_grade_subject_args
+    from .merge_transcripts import merge_clean_complete
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = ROOT / "scripts"
@@ -46,6 +57,10 @@ def parse_args() -> argparse.Namespace:
         help="Audio part length: 0, 900, 1800, or 3600 seconds.",
     )
     parser.add_argument("--skip-frames", action="store_true", help="Skip key frame extraction.")
+    parser.add_argument("--skip-clean", action="store_true", help="Skip ASR clean pass and use raw transcript for outline.")
+    parser.add_argument("--skip-context-infer", action="store_true", help="Write unknown course context without LLM.")
+    parser.add_argument("--grade", help="Manual grade override. Must be paired with --subject.")
+    parser.add_argument("--subject", help="Manual subject override. Must be paired with --grade.")
     parser.add_argument("--resume", action="store_true", help="Skip completed steps.")
     return parser.parse_args()
 
@@ -80,12 +95,15 @@ def normalize_seq(seq: str | None) -> int | str | None:
 
 def write_course_info(output_directory: Path, seq: str | None, title: str, page_url: str) -> None:
     output_directory.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "seq": normalize_seq(seq),
-        "title": title,
-        "page_url": page_url,
-    }
-    (output_directory / "course_info.json").write_text(
+    path = output_directory / "course_info.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig")) if path.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        payload = {}
+    payload["seq"] = normalize_seq(seq)
+    payload["title"] = title
+    payload["page_url"] = page_url
+    path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
@@ -136,16 +154,32 @@ def transcripts_complete(output_directory: Path) -> bool:
     return True
 
 
-def merge_exists(output_directory: Path) -> bool:
+def merge_raw_exists(output_directory: Path) -> bool:
     return (output_directory / "transcript.txt").exists()
+
+
+def merge_clean_exists(output_directory: Path) -> bool:
+    return merge_clean_complete(output_directory)
+
+
+def clean_parts_complete(output_directory: Path) -> bool:
+    transcripts_dir = output_directory / "transcript_parts"
+    raw_parts = [
+        path
+        for path in sorted(transcripts_dir.glob("transcript_part_*.txt"))
+        if not path.stem.endswith("_clean")
+    ]
+    if not raw_parts:
+        return False
+    return all(clean_complete(output_directory, int(path.stem.rsplit("_", 1)[1])) for path in raw_parts)
 
 
 def frames_exist(output_directory: Path) -> bool:
     return any((output_directory / "frames").glob("*.jpg"))
 
 
-def outline_exists(output_directory: Path) -> bool:
-    return (output_directory / "outline.md").exists()
+def outline_exists(output_directory: Path, *, force_raw: bool = False) -> bool:
+    return outline_complete(output_directory, preferred="raw" if force_raw else "auto")
 
 
 def m3u8_exists(output_directory: Path) -> bool:
@@ -256,6 +290,38 @@ def extract_frames_by_video_parts(output_directory: Path, video_url: str, part_s
         )
 
 
+def infer_context_command(
+    *,
+    grade: str | None = None,
+    subject: str | None = None,
+    skip_context_infer: bool = False,
+) -> list[str]:
+    validate_grade_subject_args(grade, subject)
+    cmd = [sys.executable, script_path("infer_course_context.py")]
+    if grade and subject:
+        cmd.extend(["--grade", grade, "--subject", subject])
+    elif skip_context_infer:
+        cmd.append("--skip-context-infer")
+    return cmd
+
+
+def clean_command() -> list[str]:
+    return [sys.executable, script_path("clean_transcript.py")]
+
+
+def merge_clean_command() -> list[str]:
+    return [sys.executable, script_path("merge_transcripts.py"), "--clean"]
+
+
+def outline_command(*, resume: bool, force_raw: bool) -> list[str]:
+    cmd = [sys.executable, script_path("generate_outline_deepseek.py")]
+    if resume:
+        cmd.append("--resume")
+    if force_raw:
+        cmd.extend(["--transcript-source", "raw"])
+    return cmd
+
+
 def run_pipeline_step(
     *,
     step: str,
@@ -265,8 +331,11 @@ def run_pipeline_step(
     completion: Callable[[], bool],
     action: Callable[[], None],
 ) -> None:
-    if resume and state.get(step) in {"done", "skipped"}:
-        print(f"skip_step={step} status={state[step]}")
+    if resume and state.get(step) == "skipped" and completion():
+        print(f"skip_step={step} status=skipped")
+        return
+    if resume and state.get(step) == "done" and completion():
+        print(f"skip_step={step} status=done")
         return
     if resume and completion():
         print(f"skip_step={step} reason=completion_exists")
@@ -287,6 +356,7 @@ def run_pipeline_step(
 
 def main() -> None:
     args = parse_args()
+    validate_grade_subject_args(args.grade, args.subject)
     load_config()
 
     out = args.output_dir
@@ -344,13 +414,50 @@ def main() -> None:
     )
 
     run_pipeline_step(
-        step="merge",
+        step="merge_raw",
         state_path=state_path,
         state=state,
         resume=args.resume,
-        completion=lambda: merge_exists(out),
+        completion=lambda: merge_raw_exists(out),
         action=lambda: run_child([sys.executable, script_path("merge_transcripts.py")], env),
     )
+
+    run_pipeline_step(
+        step="infer_context",
+        state_path=state_path,
+        state=state,
+        resume=args.resume,
+        completion=lambda: infer_context_complete(out),
+        action=lambda: run_child(
+            infer_context_command(
+                grade=args.grade,
+                subject=args.subject,
+                skip_context_infer=args.skip_context_infer,
+            ),
+            env,
+        ),
+    )
+
+    if args.skip_clean:
+        mark_state(state_path, state, "clean", "skipped")
+        mark_state(state_path, state, "merge_clean", "skipped")
+    else:
+        run_pipeline_step(
+            step="clean",
+            state_path=state_path,
+            state=state,
+            resume=args.resume,
+            completion=lambda: clean_parts_complete(out),
+            action=lambda: run_child(clean_command(), env),
+        )
+        run_pipeline_step(
+            step="merge_clean",
+            state_path=state_path,
+            state=state,
+            resume=args.resume,
+            completion=lambda: merge_clean_exists(out),
+            action=lambda: run_child(merge_clean_command(), env),
+        )
 
     if args.skip_frames:
         frames_dir = out / "frames"
@@ -366,16 +473,13 @@ def main() -> None:
             action=lambda: extract_frames_by_video_parts(out, video_url, args.part_seconds, env),
         )
 
-    outline_args = [sys.executable, script_path("generate_outline_deepseek.py")]
-    if args.resume:
-        outline_args.append("--resume")
     run_pipeline_step(
         step="outline",
         state_path=state_path,
         state=state,
         resume=args.resume,
-        completion=lambda: outline_exists(out),
-        action=lambda: run_child(outline_args, env),
+        completion=lambda: outline_exists(out, force_raw=args.skip_clean),
+        action=lambda: run_child(outline_command(resume=args.resume, force_raw=args.skip_clean), env),
     )
 
     print(f"pipeline_state={state_path}")

@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import os
 import sys
 import uuid
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from openpyxl import Workbook
 
 ROOT = Path(__file__).resolve().parents[1]
-TEST_ROOT = ROOT / ".codex_tmp" / "tests"
+TEST_ROOT = Path(os.getenv("CODEX_TEST_ROOT", str(ROOT / ".codex_tmp" / "tests")))
 TEST_ROOT.mkdir(parents=True, exist_ok=True)
 SCRIPTS = ROOT / "scripts"
 for path in (ROOT, SCRIPTS):
@@ -61,8 +63,62 @@ class RunBatchTests(unittest.TestCase):
 
         self.assertIn("--resume", cmd)
         self.assertIn("--part-seconds", cmd)
+        self.assertNotIn("--grade", cmd)
+        self.assertNotIn("--subject", cmd)
         self.assertFalse(run_batch.should_skip_task(task, {}, False))
         self.assertIsNone(run_batch.skipped_outline_path(task, False))
+
+    def test_resume_skip_requires_fresh_outline_metadata(self) -> None:
+        task = run_batch.BatchTask(
+            row_number=2,
+            seq=7,
+            title="Course A",
+            page_url="https://example.com/page",
+            output_dir=TEST_ROOT / "batch" / "007_Course A",
+            progress_key="007_Course A",
+        )
+        task.output_dir.mkdir(parents=True, exist_ok=True)
+        (task.output_dir / "outline.md").write_text("# stale\n", encoding="utf-8")
+
+        with patch.object(run_batch, "outline_complete", return_value=False):
+            self.assertFalse(run_batch.should_skip_task(task, {}, True))
+            self.assertIsNone(run_batch.skipped_outline_path(task, True))
+
+    def test_build_pipeline_command_can_forward_skip_llm_flags(self) -> None:
+        task = run_batch.BatchTask(
+            row_number=2,
+            seq=7,
+            title="Course A",
+            page_url="https://example.com/page",
+            output_dir=TEST_ROOT / "batch" / "007_Course A",
+            progress_key="007_Course A",
+        )
+
+        cmd = run_batch.build_pipeline_command(
+            task,
+            900,
+            True,
+            skip_clean=True,
+            skip_context_infer=True,
+        )
+
+        self.assertIn("--skip-clean", cmd)
+        self.assertIn("--skip-context-infer", cmd)
+
+    def test_workers_over_one_rejected_when_llm_steps_active(self) -> None:
+        with self.assertRaises(ValueError):
+            run_batch.validate_worker_policy(
+                workers=2,
+                skip_context_infer=True,
+                skip_clean=True,
+            )
+        with self.assertRaises(ValueError):
+            run_batch.validate_worker_policy(
+                workers=2,
+                skip_context_infer=False,
+                skip_clean=True,
+            )
+        run_batch.validate_worker_policy(workers=1, skip_context_infer=False, skip_clean=False)
 
     def test_load_progress_and_sanitize_title(self) -> None:
         path = TEST_ROOT / "batch" / uuid.uuid4().hex / "batch_progress.json"

@@ -9,12 +9,13 @@ from scripts.common import find_ffmpeg
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TEST_ROOT = Path(os.getenv("CODEX_TEST_ROOT", str(ROOT / ".codex_tmp" / "tests")))
 PYTHON = Path(os.environ.get("PYTHON_EXE", r"C:\Users\Administrator\AppData\Local\Programs\Python\Python313\python.exe"))
 
 
 class SplitAudioTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.workdir = ROOT / ".codex_tmp" / "tests" / "split_audio"
+        self.workdir = TEST_ROOT / "split_audio"
         self.workdir.mkdir(parents=True, exist_ok=True)
         self.ffmpeg = find_ffmpeg()
         self.env = os.environ.copy()

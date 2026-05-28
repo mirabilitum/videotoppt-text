@@ -11,7 +11,7 @@ from scripts.common import find_ffmpeg
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TEST_ROOT = ROOT / ".codex_tmp" / "tests"
+TEST_ROOT = Path(os.getenv("CODEX_TEST_ROOT", str(ROOT / ".codex_tmp" / "tests")))
 TEST_ROOT.mkdir(parents=True, exist_ok=True)
 PYTHON = Path(os.environ.get("PYTHON_EXE", r"C:\Users\Administrator\AppData\Local\Programs\Python\Python313\python.exe"))
 

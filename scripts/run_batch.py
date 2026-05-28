@@ -17,6 +17,11 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - import fallback for tests
     from .common import load_config
 
+try:
+    from generate_outline_deepseek import outline_complete
+except ModuleNotFoundError:  # pragma: no cover - import fallback for tests
+    from .generate_outline_deepseek import outline_complete
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_XLSX = Path("D:/video/学科+播放页地址.xlsx")
@@ -169,19 +174,26 @@ def should_skip_task(
 ) -> bool:
     if not resume:
         return False
-    if (task.output_dir / "outline.md").exists():
+    if outline_complete(task.output_dir):
         return True
     return False
 
 
 def skipped_outline_path(task: BatchTask, resume: bool) -> str | None:
     outline_path = task.output_dir / "outline.md"
-    if resume and outline_path.exists():
+    if resume and outline_complete(task.output_dir):
         return str(outline_path)
     return None
 
 
-def build_pipeline_command(task: BatchTask, part_seconds: int, resume: bool) -> list[str]:
+def build_pipeline_command(
+    task: BatchTask,
+    part_seconds: int,
+    resume: bool,
+    *,
+    skip_clean: bool = False,
+    skip_context_infer: bool = False,
+) -> list[str]:
     cmd = [
         sys.executable,
         str(ROOT / "scripts" / "run_pipeline.py"),
@@ -198,14 +210,45 @@ def build_pipeline_command(task: BatchTask, part_seconds: int, resume: bool) -> 
     ]
     if resume:
         cmd.append("--resume")
+    if skip_clean:
+        cmd.append("--skip-clean")
+    if skip_context_infer:
+        cmd.append("--skip-context-infer")
     return cmd
 
 
-def run_task(task: BatchTask, part_seconds: int, resume: bool) -> TaskResult:
+def validate_worker_policy(
+    *,
+    workers: int,
+    skip_context_infer: bool,
+    skip_clean: bool,
+) -> None:
+    llm_active = True
+    if workers > 1 and llm_active:
+        raise ValueError(
+            "--workers > 1 is disabled while LLM steps are active. "
+            "Use --workers 1 for context, clean, and outline generation."
+        )
+
+
+def run_task(
+    task: BatchTask,
+    part_seconds: int,
+    resume: bool,
+    *,
+    skip_clean: bool = False,
+    skip_context_infer: bool = False,
+) -> TaskResult:
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     completed = subprocess.run(
-        build_pipeline_command(task, part_seconds, resume),
+        build_pipeline_command(
+            task,
+            part_seconds,
+            resume,
+            skip_clean=skip_clean,
+            skip_context_infer=skip_context_infer,
+        ),
         check=False,
         cwd=str(ROOT),
         env=env,
@@ -244,6 +287,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--resume", action="store_true", help="Skip entries with outline.md.")
+    parser.add_argument("--skip-clean", action="store_true", help="Forward --skip-clean to run_pipeline.py.")
+    parser.add_argument(
+        "--skip-context-infer",
+        action="store_true",
+        help="Forward --skip-context-infer to run_pipeline.py.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print tasks without executing.")
     parser.add_argument(
         "--start-row",
@@ -265,6 +314,11 @@ def main() -> None:
 
     if args.workers < 1 or args.workers > 5:
         raise ValueError("--workers must be between 1 and 5.")
+    validate_worker_policy(
+        workers=args.workers,
+        skip_context_infer=args.skip_context_infer,
+        skip_clean=args.skip_clean,
+    )
     if args.start_row is not None and args.start_row < 1:
         raise ValueError("--start-row must be a positive row number.")
     if args.end_row is not None and args.end_row < 1:
@@ -303,7 +357,13 @@ def main() -> None:
     if args.workers == 1:
         for task in runnable:
             mark_progress(progress_path, progress, task, "running")
-            result = run_task(task, args.part_seconds, args.resume)
+            result = run_task(
+                task,
+                args.part_seconds,
+                args.resume,
+                skip_clean=args.skip_clean,
+                skip_context_infer=args.skip_context_infer,
+            )
             if result.returncode == 0:
                 mark_progress(
                     progress_path,
@@ -323,7 +383,14 @@ def main() -> None:
         future_to_task = {}
         for task in runnable:
             mark_progress(progress_path, progress, task, "running")
-            future = executor.submit(run_task, task, args.part_seconds, args.resume)
+            future = executor.submit(
+                run_task,
+                task,
+                args.part_seconds,
+                args.resume,
+                skip_clean=args.skip_clean,
+                skip_context_infer=args.skip_context_infer,
+            )
             future_to_task[future] = task
 
         for future in as_completed(future_to_task):

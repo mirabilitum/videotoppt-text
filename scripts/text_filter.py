@@ -61,8 +61,12 @@ def alias_fragments(alias: str) -> set[str]:
 
     fragments: set[str] = set()
     for length in range(min_length, len(alias)):
-        for start in range(0, len(alias) - length + 1):
-            fragments.add(alias[start : start + length])
+        fragments.add(alias[:length])
+        fragments.add(alias[-length:])
+
+    core = alias.strip("_")
+    if core != alias and len(core) >= min_length:
+        fragments.add(core)
     return fragments
 
 
